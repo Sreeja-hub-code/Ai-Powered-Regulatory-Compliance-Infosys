@@ -1,12 +1,13 @@
+import os
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 def send_email(to_email, subject, message):
     # 🔐 Sender email (your Gmail)
-    from_email = "smtp_gmail.com"
+    from_email = os.getenv("SENDER_EMAIL")
 
     # 🔑 Gmail APP PASSWORD (16 characters, no spaces)
-    password = "password_from_env"
+    password = os.getenv("EMAIL_PASSWORD")
 
     msg = MIMEMultipart()
     msg["From"] = from_email

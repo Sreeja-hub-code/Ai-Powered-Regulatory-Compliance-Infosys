@@ -1,299 +1,515 @@
-# ============================================================
-# RegulaAI – Enhanced Contract Compliance & Monitoring System
-# ============================================================
-# Framework : Streamlit
-# AI        : Groq LLM (LLaMA)
-# Features  : Upload, Dashboard, Risk Analysis,
-#             Amendments, Chatbot, PDF Export, Email Alerts
-# ============================================================
-
+# stream.py - Full final version (greeting-aware chatbot + all features)
 import streamlit as st
-import os, io, re, smtplib
 from datetime import datetime
-import matplotlib.pyplot as plt
-
-import pypdf
+import io
+import os
+import re
+import PyPDF2
+import smtplib
+import pandas as pd
 from email.message import EmailMessage
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
 from dotenv import load_dotenv
 from groq import Groq
+import matplotlib.pyplot as plt
 
-# ============================================================
+# ===========================================
 # PAGE CONFIG
-# ============================================================
-st.set_page_config(
-    page_title="RegulaAI – Compliance System",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ===========================================
+st.set_page_config(page_title="RegulaAI – Compliance Checker", layout="wide")
+st.title("✅ RegulaAI – Compliance Checker")
+st.caption("AI-powered Contract Compliance & Risk Analysis System")
 
-st.markdown("## ✅ RegulaAI – Contract Compliance System")
-st.caption("AI-Powered Contract Compliance & Risk Analysis Platform")
-
-# ============================================================
-# LOAD ENV
-# ============================================================
-load_dotenv()
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# ===========================================
+# EMAIL CONFIG (replace with secure storage)
+# ===========================================
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
-SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
+SENDER_PASSWORD = os.getenv("EMAIL_PASSWORD")
+# ===========================================
+# LOAD ENV + GROQ SETUP
+# ===========================================
+load_dotenv()
+GROQ_KEY = os.getenv("GROQ_API_KEY")
 
-if not GROQ_API_KEY:
-    st.error("❌ GROQ_API_KEY missing in .env file")
-    st.stop()
+if not GROQ_KEY:
+    st.error("❌ Missing GROQ_API_KEY in .env")
+else:
+    client = Groq(api_key=GROQ_KEY)
 
-client = Groq(api_key=GROQ_API_KEY)
-
-# ============================================================
+# ===========================================
 # SESSION STATE
-# ============================================================
-st.session_state.setdefault("contracts", [])
-st.session_state.setdefault("active_contract", None)
-st.session_state.setdefault("updated_contract", "")
-st.session_state.setdefault("current_page", "🏠 Dashboard")
+# ===========================================
+if "contract_text" not in st.session_state:
+    st.session_state.contract_text = ""
 
-# ============================================================
-# HELPERS
-# ============================================================
-def extract_text_from_pdf(file, limit=16000):
+if "chat" not in st.session_state:
+    st.session_state.chat = []
+
+if "updated_contract" not in st.session_state:
+    st.session_state.updated_contract = ""
+
+# ===========================================
+# PDF EXTRACT FUNCTION (ENCRYPTION FIXED)
+# ===========================================
+def extract_text_from_pdf(uploaded_file, limit_chars=16000):
+    text = ""
     try:
-        reader = pypdf.PdfReader(file)
-        if reader.is_encrypted:
-            reader.decrypt("")
-        text = ""
-        for page in reader.pages:
-            if len(text) > limit:
-                break
-            if page.extract_text():
-                text += page.extract_text() + "\n"
-        return text[:limit]
+        reader = PyPDF2.PdfReader(uploaded_file)
     except Exception as e:
-        return f"❌ PDF Error: {e}"
+        return f"❌ Error reading PDF: {e}"
 
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")  # try without password
+        except Exception:
+            return "⚠️ PDF is encrypted and cannot be processed without a password."
+
+    for page in reader.pages:
+        if len(text) > limit_chars:
+            break
+        try:
+            content = page.extract_text()
+        except Exception:
+            content = None
+        if content:
+            text += content + "\n"
+
+    return text[:limit_chars]
+
+# ===========================================
+# RISK CALCULATION
+# ===========================================
 def calculate_risk(text):
     score = 0
-    reasons = []
-    t = text.lower()
+    risks = []
 
-    if "termination" in t:
-        score += 20; reasons.append("Termination clause detected")
-    if "liability" in t:
-        score += 25; reasons.append("Liability clause detected")
-    if "indemn" in t:
-        score += 20; reasons.append("Indemnification clause detected")
-    if "gdpr" not in t and any(x in t for x in ["personal data","privacy","data protection"]):
-        score += 15; reasons.append("Missing GDPR compliance")
+    low_text = text.lower()
+    if "termination" in low_text:
+        score += 20
+        risks.append("Termination clause may cause contract imbalance.")
+    if "liability" in low_text:
+        score += 25
+        risks.append("Liability clause requires review.")
+    if "indemn" in low_text:
+        score += 20
+        risks.append("Indemnification clause contains high-risk terms.")
+    if "gdpr" not in low_text and any(word in low_text for word in ["personal data", "data protection", "privacy"]):
+        score += 15
+        risks.append("Missing explicit GDPR/compliance section.")
+    return score, risks
 
-    return score, reasons
+# ===========================================
+# AI CHATBOT (greeting-aware, contract-aware)
+# ===========================================
+def ask_groq(question):
+    try:
+        now = datetime.now()
+        lower_q = (question or "").lower()
+        # detect if user explicitly wants date/time/day
+        wants_datetime = any(kw in lower_q for kw in [
+            "time", "date", "day", "today", "current time", "now", "which day", "what day", "what is the time"
+        ])
 
-def ask_groq(question, contract_text):
-    system_prompt = f"""
+        contract_text = st.session_state.contract_text if st.session_state.contract_text else "[NO CONTRACT UPLOADED]"
+
+        if wants_datetime:
+            # System prompt constrained to only answer with date/time info when asked
+            system_context = f"""
+You must answer accurately using the real system date/time provided below.
+Do NOT include extra commentary unless the user asks for it.
+
+Current Date: {now.strftime('%B %d, %Y')}
+Day: {now.strftime('%A')}
+Time (24-hour): {now.strftime('%H:%M:%S')}
+Time (12-hour): {now.strftime('%I:%M:%S %p')}
+Timezone: System Local Time
+
+If the user asks about date/time/day, respond concisely with the requested value using the provided information.
+If the user asks anything else in the same message, include both the date/time and then answer the other part.
+"""
+        else:
+            # Full intelligent assistant behavior without forcing date/time responses
+            system_context = f"""
 You are RegulaAI — an AI Legal Assistant.
 
-Rules:
-1. Use ONLY the provided contract.
-2. If no contract exists, say: "Please upload a contract first."
-3. Do NOT add new obligations.
-4. For amendments:
-   [[UPDATED]]...[[/UPDATED]]
-   [[REMOVED]]...[[/REMOVED]]
+Behavior rules:
+1. DO NOT mention date or time unless the user explicitly asks for it.
+2. For greetings (hello, hi, hey), respond naturally, e.g. "Hello! How can I help you today?"
+3. For contract-related requests, ALWAYS use the uploaded contract (below). If no contract present, respond: "Please upload a contract first."
+4. For "summarize", "extract clauses", "show risks", "regulatory rules", or clause Q&A, analyze the contract and answer based on its content.
+5. For "generate amendments", return modified clauses using [[UPDATED]]...[[/UPDATED]] for additions and [[REMOVED]]...[[/REMOVED]] for removals.
+6. NEVER guess the date/time/day. If user asks for date/time/day, use system provided values only.
 
-Contract:
+Contract text (may be "[NO CONTRACT UPLOADED]"):
 {contract_text}
 """
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role":"system","content":system_prompt},
-            {"role":"user","content":question}
-        ]
-    )
-    return response.choices[0].message.content
 
-def generate_pdf(text):
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system_context},
+                {"role": "user", "content": question}
+            ],
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"AI Error: {e}"
+
+# ===========================================
+# Utility: draw updated PDF with underlines & strike-throughs
+# ===========================================
+def generate_highlighted_pdf(text_with_markers):
+    PAGE_WIDTH, PAGE_HEIGHT = A4
+    left_margin = 40
+    right_margin = 40
+    top_margin = PAGE_HEIGHT - 40
+    line_height = 14  # points
+    max_width = PAGE_WIDTH - left_margin - right_margin
+
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=A4)
     pdf.setFont("Helvetica", 11)
 
-    y = 800
-    for line in text.split("\n"):
-        if "[[UPDATED]]" in line:
-            clean = re.sub(r"\[\[/?UPDATED\]\]", "", line)
-            pdf.setFillColorRGB(1,0,0)
-            pdf.drawString(40,y,clean)
-            pdf.line(40,y-2,520,y-2)
-        elif "[[REMOVED]]" in line:
-            clean = re.sub(r"\[\[/?REMOVED\]\]", "", line)
-            pdf.setFillColorRGB(0.4,0.4,0.4)
-            pdf.drawString(40,y,clean)
-            pdf.line(40,y+4,520,y+4)
-        else:
-            pdf.setFillColorRGB(0,0,0)
-            pdf.drawString(40,y,line)
+    y = top_margin
 
-        y -= 14
-        if y < 40:
-            pdf.showPage()
-            pdf.setFont("Helvetica",11)
-            y = 800
+    segment_re = re.compile(
+        r'(\[\[UPDATED\]\].*?\[\[/UPDATED\]\]|\[\[REMOVED\]\].*?\[\[/REMOVED\]\]|\[?[^[]+)',
+        flags=re.DOTALL
+    )
 
+    def wrap_text_to_chunks(s):
+        words = s.split()
+        if not words:
+            return ['']
+        lines = []
+        cur = words[0]
+        for w in words[1:]:
+            test = cur + ' ' + w
+            if pdf.stringWidth(test, "Helvetica", 11) <= max_width:
+                cur = test
+            else:
+                lines.append(cur)
+                cur = w
+        lines.append(cur)
+        return lines
+
+    for raw_line in text_with_markers.split("\n"):
+        if raw_line.strip() == "":
+            y -= line_height
+            if y < 40:
+                pdf.showPage()
+                pdf.setFont("Helvetica", 11)
+                y = top_margin
+            continue
+
+        segs = segment_re.findall(raw_line)
+        styled_segments = []
+        for seg in segs:
+            seg = seg or ""
+            seg = seg.replace("\r", "")
+            if seg.startswith("[[UPDATED]]") and seg.endswith("[[/UPDATED]]"):
+                inner = seg[len("[[UPDATED]]"):-len("[[/UPDATED]]")]
+                styled_segments.append((inner, "updated"))
+            elif seg.startswith("[[REMOVED]]") and seg.endswith("[[/REMOVED]]"):
+                inner = seg[len("[[REMOVED]]"):-len("[[/REMOVED]]")]
+                styled_segments.append((inner, "removed"))
+            else:
+                styled_segments.append((seg, "plain"))
+
+        printable_lines = []
+        current_line = []
+        current_line_width = 0
+
+        for seg_text, style in styled_segments:
+            pieces = seg_text.split("\n")
+            for pi, piece in enumerate(pieces):
+                piece = piece if piece is not None else ""
+                if piece == "":
+                    piece_wrapped = ['']
+                else:
+                    piece_wrapped = wrap_text_to_chunks(piece)
+
+                for wi, wpiece in enumerate(piece_wrapped):
+                    draw_text = wpiece
+                    # leading space logic
+                    if current_line and not draw_text.startswith(" "):
+                        test_text = " " + draw_text
+                    else:
+                        test_text = draw_text
+                    test_width = pdf.stringWidth(test_text, "Helvetica", 11)
+                    if current_line_width + test_width <= max_width:
+                        if current_line and not draw_text.startswith(" "):
+                            draw_text = " " + draw_text
+                        current_line.append((draw_text, style))
+                        current_line_width += pdf.stringWidth(draw_text, "Helvetica", 11)
+                    else:
+                        if current_line:
+                            printable_lines.append(current_line)
+                        current_line = [(draw_text, style)]
+                        current_line_width = pdf.stringWidth(draw_text, "Helvetica", 11)
+                if pi < len(pieces) - 1:
+                    if current_line:
+                        printable_lines.append(current_line)
+                    current_line = []
+                    current_line_width = 0
+
+        if current_line:
+            printable_lines.append(current_line)
+
+        for pline in printable_lines:
+            x = left_margin
+            for seg_text, style in pline:
+                if seg_text == "":
+                    seg_text = ""
+                if style == "plain":
+                    pdf.setFillColorRGB(0, 0, 0)
+                    pdf.drawString(x, y, seg_text)
+                    tw = pdf.stringWidth(seg_text, "Helvetica", 11)
+                    x += tw
+                elif style == "updated":
+                    pdf.setFillColorRGB(1, 0, 0)
+                    pdf.drawString(x, y, seg_text)
+                    tw = pdf.stringWidth(seg_text, "Helvetica", 11)
+                    underline_y = y - 2
+                    pdf.setLineWidth(0.9)
+                    pdf.setStrokeColorRGB(1, 0, 0)
+                    pdf.line(x, underline_y, x + tw, underline_y)
+                    x += tw
+                    pdf.setFillColorRGB(0, 0, 0)
+                elif style == "removed":
+                    pdf.setFillColorRGB(0.2, 0.2, 0.2)
+                    pdf.drawString(x, y, seg_text)
+                    tw = pdf.stringWidth(seg_text, "Helvetica", 11)
+                    strike_y = y + 4
+                    pdf.setLineWidth(1.0)
+                    pdf.setStrokeColorRGB(1, 0, 0)
+                    pdf.line(x, strike_y, x + tw, strike_y)
+                    x += tw
+                    pdf.setFillColorRGB(0, 0, 0)
+            y -= line_height
+            if y < 40:
+                pdf.showPage()
+                pdf.setFont("Helvetica", 11)
+                y = top_margin
+
+    pdf.showPage()
     pdf.save()
     buffer.seek(0)
     return buffer
 
-# ============================================================
+# ===========================================
 # SIDEBAR NAVIGATION
-# ============================================================
-pages = [
-    "🏠 Dashboard",
-    "📤 Upload Contract",
-    "🌍 Global Contracts",
-    "📊 Risk Analysis",
-    "🛠️ Amendments",
-    "💬 Chatbot"
-]
-
+# ===========================================
 page = st.sidebar.radio(
-    "Navigation",
-    pages,
-    index=pages.index(st.session_state.current_page)
+    "Navigate",
+    ["Upload Contract", "Risk Dashboard", "Regulatory Updates", "Amendment System", "AI Chatbot"]
 )
 
-# ============================================================
-# DASHBOARD
-# ============================================================
-if page == "🏠 Dashboard":
-    st.session_state.current_page = page
+# ===========================================
+# PAGE 1 — UPLOAD CONTRACT
+# ===========================================
+if page == "Upload Contract":
+    st.subheader("📤 Upload Contract Document")
 
-    total = len(st.session_state.contracts)
-    risky = sum(1 for c in st.session_state.contracts if c["risk"] > 50)
+    uploaded_file = st.file_uploader("Upload PDF contract", type=["pdf"])
 
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Total Contracts", total)
-    c2.metric("High Risk", risky)
-    c3.metric("Groq API", "Connected")
-    c4.metric("System", "Stable")
+    if uploaded_file:
+        text = extract_text_from_pdf(uploaded_file)
+        st.session_state.contract_text = text
 
-    if st.session_state.contracts:
-        last = st.session_state.contracts[-1]
-        st.info(f"📄 Last Uploaded: **{last['name']}** | Risk: **{last['risk']}%**")
-
-# ============================================================
-# UPLOAD CONTRACT
-# ============================================================
-elif page == "📤 Upload Contract":
-    st.session_state.current_page = page
-
-    file = st.file_uploader("Upload Contract PDF", type=["pdf"])
-    if file:
-        text = extract_text_from_pdf(file)
-        if text.startswith("❌"):
+        if text.startswith("⚠️") or text.startswith("❌"):
             st.error(text)
         else:
-            risk, reasons = calculate_risk(text)
-            st.session_state.contracts.append({
-                "name": file.name,
-                "text": text,
-                "risk": risk,
-                "reasons": reasons,
-                "uploaded": datetime.now().strftime("%Y-%m-%d %H:%M")
-            })
             st.success("✅ Contract uploaded successfully")
-            st.session_state.current_page = "🏠 Dashboard"
-            st.rerun()
+            risk_score, risks = calculate_risk(text)
+            st.metric("Risk Level", "HIGH ⚠️" if risk_score > 50 else "MEDIUM")
+            st.subheader("📄 Extracted Contract Content")
+            st.text_area("Contract Text", text, height=350)
 
-# ============================================================
-# GLOBAL CONTRACTS
-# ============================================================
-elif page == "🌍 Global Contracts":
-    st.session_state.current_page = page
+# ===========================================
+# PAGE 2 — RISK DASHBOARD
+# ===========================================
+elif page == "Risk Dashboard":
+    st.subheader("📊 Risk Dashboard")
 
-    if not st.session_state.contracts:
-        st.info("No contracts uploaded yet")
-    else:
-        for i,c in enumerate(st.session_state.contracts):
-            with st.expander(f"{c['name']} | Risk {c['risk']}%"):
-                st.write("Uploaded:", c["uploaded"])
-                st.write("Issues:", ", ".join(c["reasons"]) or "None")
-                if st.button("Select Contract", key=i):
-                    st.session_state.active_contract = c
-                    st.success("Contract selected")
-
-# ============================================================
-# RISK ANALYSIS
-# ============================================================
-elif page == "📊 Risk Analysis":
-    st.session_state.current_page = page
-    c = st.session_state.active_contract
-
-    if not c:
-        st.warning("Select a contract first")
+    if not st.session_state.contract_text:
+        st.warning("Please upload a contract first.")
         st.stop()
+
+    risk_score, risks = calculate_risk(st.session_state.contract_text)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Risk Score", risk_score)
+    col2.metric("Issues Found", len(risks))
+    col3.metric("Compliance Level", "LOW" if risk_score > 60 else "MEDIUM")
 
     fig, ax = plt.subplots()
-    ax.pie([c["risk"],100-c["risk"]], labels=["Risk","Safe"], autopct="%1.1f%%")
+    ax.pie(
+        [risk_score, max(0, 100 - risk_score)],
+        labels=["Risk", "Safe"],
+        autopct="%1.1f%%",
+        startangle=90
+    )
     st.pyplot(fig)
 
-    for r in c["reasons"]:
-        st.error(r)
+    st.subheader("⚠️ Detected Risks")
+    if risks:
+        for r in risks:
+            st.error(r)
+    else:
+        st.success("No automated risks detected by the basic scanner.")
 
-# ============================================================
-# AMENDMENTS
-# ============================================================
-elif page == "🛠️ Amendments":
-    st.session_state.current_page = page
-    c = st.session_state.active_contract
+    risk_data = pd.DataFrame({
+        "Risk Type": ["Termination", "Liability", "Indemnification", "Missing GDPR"],
+        "Score": [
+            20 if "termination" in st.session_state.contract_text.lower() else 0,
+            25 if "liability" in st.session_state.contract_text.lower() else 0,
+            20 if "indemn" in st.session_state.contract_text.lower() else 0,
+            15 if "gdpr" not in st.session_state.contract_text.lower() else 0
+        ]
+    })
 
-    if not c:
-        st.warning("Select a contract first")
+    st.subheader("📈 Risk Trend / Line Chart")
+    st.line_chart(risk_data.set_index("Risk Type"))
+
+    st.subheader("📘 Clause Analysis")
+    st.table(pd.DataFrame({
+        "Clause": ["Termination", "Liability", "Indemnification", "GDPR"],
+        "Found": [
+            "Yes" if "termination" in st.session_state.contract_text.lower() else "No",
+            "Yes" if "liability" in st.session_state.contract_text.lower() else "No",
+            "Yes" if "indemn" in st.session_state.contract_text.lower() else "No",
+            "Yes" if "gdpr" in st.session_state.contract_text.lower() else "No"
+        ]
+    }))
+
+    st.subheader("📊 Risk Comparison Chart")
+    st.bar_chart(risk_data.set_index("Risk Type"))
+
+    with st.expander("📄 Detailed Risk Data"):
+        st.dataframe(risk_data)
+
+# ===========================================
+# PAGE 3 — REGULATORY UPDATES
+# ===========================================
+elif page == "Regulatory Updates":
+    st.subheader("📜 Regulatory Update Monitor")
+
+    if not st.session_state.contract_text:
+        st.warning("⚠️ Please upload a contract first.")
         st.stop()
 
-    st.text_area("Original Contract", c["text"], height=220)
+    st.info("🔍 Analyzing contract for regulatory requirements…")
 
-    if st.button("Generate Amendments"):
-        st.session_state.updated_contract = ask_groq(
-            "Improve compliance and clarity using [[UPDATED]] and [[REMOVED]]",
-            c["text"]
-        )
+    prompt = f"""
+Read the following contract and extract ONLY the regulatory or compliance-related rules.
+
+Contract:
+{st.session_state.contract_text}
+
+Return the rules as a numbered list.
+"""
+
+    result = ask_groq(prompt)
+
+    st.success("✅ Regulatory rules extracted successfully")
+    st.markdown("### 📌 Rules Identified from Contract")
+    st.markdown(result)
+
+# ===========================================
+# PAGE 4 — AMENDMENT SYSTEM
+# ===========================================
+elif page == "Amendment System":
+    if not st.session_state.contract_text:
+        st.warning("⚠️ Please upload the original contract first")
+        st.stop()
+
+    st.subheader("🛠️ Smart Contract Amendment System")
+    original_text = st.session_state.contract_text
+    st.text_area("📄 Original Contract", original_text, height=220)
+    st.write("---")
+
+    receiver_email = st.text_input("📧 Enter email to send updated contract")
+
+    if st.button("✨ Generate Updated Contract"):
+        with st.spinner("Analyzing and updating…"):
+            prompt = f"""
+Improve clarity, grammar, and legal consistency of this contract.
+When suggesting removals, wrap removed text with [[REMOVED]]...[[/REMOVED]].
+When suggesting additions/updates, wrap added or modified text with [[UPDATED]]...[[/UPDATED]].
+Do NOT add new obligations. Only refine what is present.
+
+Contract:
+{original_text}
+"""
+            updated = ask_groq(prompt)
+        st.session_state.updated_contract = updated
+        st.success("✅ Updated contract generated!")
 
     if st.session_state.updated_contract:
-        st.text_area("Updated Contract", st.session_state.updated_contract, height=300)
+        st.subheader("📘 Updated Contract (Markers shown)")
+        st.text_area("Updated Version (markers shown)", st.session_state.updated_contract, height=300)
 
-        email = st.text_input("Recipient Email")
-        if st.button("Send PDF"):
-            pdf = generate_pdf(st.session_state.updated_contract)
-            msg = EmailMessage()
-            msg["From"] = SENDER_EMAIL
-            msg["To"] = email
-            msg["Subject"] = "Updated Contract – RegulaAI"
-            msg.set_content("Attached is the updated contract.")
-            msg.add_attachment(pdf.read(), maintype="application", subtype="pdf", filename="updated_contract.pdf")
+    if st.button("📨 Send Updated Contract PDF"):
+        if not receiver_email:
+            st.warning("⚠️ Enter email address")
+            st.stop()
+        if not st.session_state.updated_contract:
+            st.warning("⚠️ Generate the updated contract first")
+            st.stop()
 
-            try:
-                with smtplib.SMTP_SSL("smtp.gmail.com",465) as s:
-                    s.login(SENDER_EMAIL,SENDER_PASSWORD)
-                    s.send_message(msg)
-                st.success("📧 Email sent successfully")
-            except Exception as e:
-                st.error(e)
+        pdf_buffer = generate_highlighted_pdf(st.session_state.updated_contract)
 
-# ============================================================
-# CHATBOT
-# ============================================================
-elif page == "💬 Chatbot":
-    st.session_state.current_page = page
-    c = st.session_state.active_contract
+        msg = EmailMessage()
+        msg["Subject"] = "Updated Contract – RegulaAI"
+        msg["From"] = SENDER_EMAIL
+        msg["To"] = receiver_email
+        msg.set_content("Attached is the updated contract with highlighted changes.")
 
-    if not c:
-        st.warning("Select a contract first")
-        st.stop()
+        msg.add_attachment(
+            pdf_buffer.read(),
+            maintype="application",
+            subtype="pdf",
+            filename="updated_contract.pdf"
+        )
 
-    q = st.text_input("Ask a question about this contract")
-    if st.button("Ask"):
-        st.write("**AI:**", ask_groq(q, c["text"]))
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                server.send_message(msg)
+            st.success("✅ Updated PDF sent to email successfully!")
+        except Exception as e:
+            st.error(f"❌ Email failed: {e}")
 
-# ============================================================
-# END
-# ============================================================
+# ===========================================
+# PAGE 5 — AI CHATBOT (Full intelligent mode)
+# ===========================================
+elif page == "AI Chatbot":
+    st.subheader("🤖 AI Chatbot – Ask Anything")
+    st.markdown("Ask contract-specific or general questions. If a contract is uploaded the assistant will use it automatically.")
+
+    question = st.text_input("Ask a question:")
+
+    # Quick helper buttons
+    col_a, col_b, col_c, col_d = st.columns(4)
+    if col_a.button("Summarize Contract"):
+        question = "Summarize the contract"
+    if col_b.button("Extract Clauses"):
+        question = "Extract clauses from the contract"
+    if col_c.button("Show Risks"):
+        question = "Show risks in the contract"
+    if col_d.button("Regulatory Rules"):
+        question = "Extract regulatory/compliance rules from the contract"
+
+    if st.button("Ask") and question:
+        with st.spinner("Thinking…"):
+            answer = ask_groq(question)
+        st.session_state.chat.append((question, answer))
+
+    # Chat history (most recent first)
+    for q, a in reversed(st.session_state.chat):
+        st.write(f"🧑 **You:** {q}")
+        st.write(f"🤖 **AI:** {a}")
+        st.write("---")
